@@ -29,10 +29,12 @@ signal refreshed ##emmits whenever refresh is called
 @export_range(1.0, 3.0, 0.05) var connect_margin: float = 1.0 ##scalar of spacing that determines whether points get connected in SURFACE mode
 @export_tool_button("Reset") var reset: Callable = _reset ##calls the reset function, clearing all associated nodes and caches
 
-var _astar_grid:    AStar3DModified = AStar3DModified.new() ##the navigation brain storing the grid of points
-var _astar_surface: AStar3DModified = AStar3DModified.new() ##the navigation brain storing the point grids on surfaces
+var paths: Dictionary[Node3D, Path] ##all of the path states requested by navigation agents (any Node3D that calls next_point)
 var points: PackedInt64Array: ##all of the point ids from both the grid and surface astars
 	get(): return _astar_grid.get_point_ids() + _astar_surface.get_point_ids()
+
+var _astar_grid:    AStar3DModified = AStar3DModified.new() ##the navigation brain storing the grid of points
+var _astar_surface: AStar3DModified = AStar3DModified.new() ##the navigation brain storing the point grids on surfaces
 var _tick: int = 0 ##tracks the amount of refreshes that have occured
 #NOTE: yes I understand very well that the boolean value is never used whatsoever but Dictionarys
 #      run faster than Arrays, and since there's a lot of points, performance is everything!!
@@ -47,7 +49,7 @@ var _shape_add: Callable = func(node: Node) -> void: ##adds a CollisionShape3D t
 	if node is CollisionShape3D: 
 		var shape: CollisionShape3D = node
 		if shape.shape: _shapes[shape] = Shape.new(shape.shape)
-var _shape_remove: Callable = func(node: Node) -> void: ##removes a CollisionShape3D from the AABB cache and disconnects it's changed signal
+var _shape_remove: Callable = func(node: Node) -> void: ##removes a CollisionShape3D from the shape cache and disconnects it's changed signal and removes its surface points
 	if node is CollisionShape3D:
 		var s: Shape = _shapes.get(node)
 		if s: 
@@ -55,7 +57,6 @@ var _shape_remove: Callable = func(node: Node) -> void: ##removes a CollisionSha
 			_remove_shape_pts(s)
 		_shapes.erase(node)
 
-var paths: Dictionary[Node3D, Path] ##all of the path states requested by navigation agents (any Node3D that calls next_point)
 #NOTE: originally I was going to do paths.set.bind(agent, state) and paths.erase.bind(agent)
 #      directly in the signals that use them, but that doesnt work because for connecting and
 #      disconnecting they need to be the same Callable and also Dictionary doesnt nativley support
@@ -88,7 +89,7 @@ func _init() -> void:
 ##handles the obstacles and renders the grid
 func _refresh() -> void:
 	_tick += 1
-	handle_shapes()
+	_handle_shapes()
 	refreshed.emit()
 
 ##clears caches, disconnects shapes, re enables disabled points, and updates astar versions
@@ -121,63 +122,11 @@ func _point_id(x: int, y: int, z: int) -> int: return (x * size * size) + (y * s
 ##end up in the same cell or are direct neighboors
 func _bucket(p: Vector3) -> Vector3i: return Vector3i((p / spacing).floor())
 
-##returns the astar to use based on the point's ID
-func astar_from_id(id: int) -> AStar3DModified: return _astar_grid if id < SURFACE_ID_OFFSET else _astar_surface
-
-##returns the astar to use based on the mode passed in
-func astar_from_mode(mode: Mode) -> AStar3DModified: return _astar_grid if mode == Mode.GRID else _astar_surface
-
-##adds a point under it's cell in the spatial hash thingy
-func _bucket_insert(id: int, p: Vector3) -> void:
-	var b: Vector3i = _bucket(p)
-	_p_bucket[id] = b
-	if !_buckets.has(b): _buckets[b] = []
-	_buckets[b].append(id)
-
-##removes a point out of the spatial hash thingy
-func _bucket_remove(id: int) -> void:
-	if _p_bucket.has(id):
-		var b: Vector3i = _p_bucket[id]
-		_buckets[b].erase(id)
-		if _buckets[b].is_empty(): _buckets.erase(b)
-		_p_bucket.erase(id)
-
-##loads a flattened 3D array of points onto the AStar3D grid with side lengths of size and spaced
-##spacing meters apart for navigation
-func generate() -> void:
-	#clears everything and updates versions
-	_astar_surface.clear()
-	_buckets = {}
-	_p_bucket = {}
-	_disabled = {}
-	_astar_grid.ver += 1
-	_astar_surface.ver += 1
-	_nid = SURFACE_ID_OFFSET
-	for s: Shape in _shapes.values(): 
-		s.pids = PackedInt64Array()
-		s.dirty = true
-	#clears the grid and reserves space for the grid (saves memory since the size is defined)
-	_astar_grid.clear()
-	_astar_grid.reserve_space(size * size * size)
-	for x: int in range(size):
-		for y: int in range(size):
-			for z: int in range(size):
-				var i: int = _point_id(x, y , z) #get the id for the point using the current x/y/z values
-				_astar_grid.add_point(i, Vector3(x, y, z) * spacing) #add the point to the grid
-				#in order for the algorithm to go between points, they have to be connected. the current
-				#point is connected to the previous point on each of it's 3 axises if it's not the first
-				#for that axis (though there will look like there's 6 connections on each inner point
-				#in the end, the next point on the axis hasnt been created yet so we cannot connect it)
-				#resulting in all points connected to their neighbors in all 6 directions
-				if x > 0: _astar_grid.connect_points(i, _point_id(x - 1, y, z))
-				if y > 0: _astar_grid.connect_points(i, _point_id(x, y - 1, z))
-				if z > 0: _astar_grid.connect_points(i, _point_id(x, y, z - 1))
-
 #NOTE: reparenting of collision shapes is unhandled
 ##tracks all of the registered CollisionShape3Ds and disables the points that are inside of their
 ##shapes, only checking points that were disabled or are in one of their AABBs to improve performance;
 ##also generates surface points on the shapes for surface navigation
-func handle_shapes() -> void:
+func _handle_shapes() -> void:
 	var disabled: Dictionary[int, bool] #the new list of disabled points
 	#physics stuff for the point querying that is reused
 	var space: PhysicsDirectSpaceState3D = get_viewport().find_world_3d().direct_space_state
@@ -242,7 +191,11 @@ func _gen_surface_pts(shape: CollisionShape3D, cache: Shape) -> void:
 		_astar_surface.add_point(id, p) #add the point to the astar
 		snap[k] = id #add to the snap cache for future deduping
 		new.append(id) #add the id to the list of ids for points just created
-		_bucket_insert(id, p) #create a bucket for the point or merge into an existing one
+		#create a bucket for the point or merge into an existing one in the spatial hash thingy
+		var b: Vector3i = _bucket(p)
+		_p_bucket[id] = b
+		if !_buckets.has(b): _buckets[b] = []
+		_buckets[b].append(id)
 	for s: int in mesh.get_surface_count():
 		if mesh.surface_get_primitive_type(s) != Mesh.PRIMITIVE_TRIANGLES: continue #this algorithm should only work on triangles, so if it's not a triangle skip it
 		#get the arrays of vertexes and indexes of the surface, part of the surface arrays
@@ -297,9 +250,45 @@ func _gen_surface_pts(shape: CollisionShape3D, cache: Shape) -> void:
 func _remove_shape_pts(cache: Shape) -> void:
 	for i: int in cache.pids:
 		_astar_surface.remove_point(i)
-		_bucket_remove(i)
+		#removes the point out of the spatial hash thingy
+		if _p_bucket.has(i):
+			var b: Vector3i = _p_bucket[i]
+			_buckets[b].erase(i)
+			if _buckets[b].is_empty(): _buckets.erase(b)
+			_p_bucket.erase(i)
 	cache.pids = PackedInt64Array()
 	_astar_surface.ver += 1
+
+##loads a flattened 3D array of points onto the AStar3D grid with side lengths of size and spaced
+##spacing meters apart for navigation
+func generate() -> void:
+	#clears everything and updates versions
+	_astar_surface.clear()
+	_buckets = {}
+	_p_bucket = {}
+	_disabled = {}
+	_astar_grid.ver += 1
+	_astar_surface.ver += 1
+	_nid = SURFACE_ID_OFFSET
+	for s: Shape in _shapes.values(): 
+		s.pids = PackedInt64Array()
+		s.dirty = true
+	#clears the grid and reserves space for the grid (saves memory since the size is defined)
+	_astar_grid.clear()
+	_astar_grid.reserve_space(size * size * size)
+	for x: int in range(size):
+		for y: int in range(size):
+			for z: int in range(size):
+				var i: int = _point_id(x, y , z) #get the id for the point using the current x/y/z values
+				_astar_grid.add_point(i, Vector3(x, y, z) * spacing) #add the point to the grid
+				#in order for the algorithm to go between points, they have to be connected. the current
+				#point is connected to the previous point on each of it's 3 axises if it's not the first
+				#for that axis (though there will look like there's 6 connections on each inner point
+				#in the end, the next point on the axis hasnt been created yet so we cannot connect it)
+				#resulting in all points connected to their neighbors in all 6 directions
+				if x > 0: _astar_grid.connect_points(i, _point_id(x - 1, y, z))
+				if y > 0: _astar_grid.connect_points(i, _point_id(x, y - 1, z))
+				if z > 0: _astar_grid.connect_points(i, _point_id(x, y, z - 1))
 
 ##called by agents, this gets the next point the agent should go to to reach the target position
 func next_point(agent: Node3D, target: Vector3, mode: Mode, radius: float = 0.0) -> Vector3:
@@ -366,6 +355,12 @@ func next_point(agent: Node3D, target: Vector3, mode: Mode, radius: float = 0.0)
 		p.idx += 1
 		next = astar.get_point_position(p.ids[p.idx])
 	return next #return this next position to go to
+
+##returns the astar to use based on the point's ID
+func astar_from_id(id: int) -> AStar3DModified: return _astar_grid if id < SURFACE_ID_OFFSET else _astar_surface
+
+##returns the astar to use based on the mode passed in
+func astar_from_mode(mode: Mode) -> AStar3DModified: return _astar_grid if mode == Mode.GRID else _astar_surface
 
 ##class storing a path state for each agent
 class Path extends RefCounted:
