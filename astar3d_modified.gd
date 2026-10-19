@@ -21,42 +21,7 @@ func _init() -> void:
 	neighbor_filter_enabled = true #allow the _filter_neighbor func to be used
 	_squery.shape = _sphere #add the sphere to the query ones
 
-##calls set_point_disabled, but updates the version too
-func set_disabled(id: int, disabled: bool = true) -> void:
-	if has_point(id):
-		super.set_point_disabled(id, disabled)
-		ver += 1
-
-##calls get_id_path, but updates the space and radius
-func find_path(from: Vector3, to: Vector3, _radius: float, _space: PhysicsDirectSpaceState3D) -> PackedInt64Array:
-	space = _space
-	radius = _radius
-	var a: int = get_closest_point(from)
-	var b: int = get_closest_point(to)
-	return PackedInt64Array() if a == -1 or b == -1 else get_id_path(a, b) #prevent bad stuff from happening if there are no points
-
-##returns if a sphere of radius r can pass between 2 points without hitting anything
-##but also does a normal raycast if the radius is 0 or below
-func is_clear(from: Vector3, to: Vector3, r: float) -> bool:
-	if space == null: return false #if there's no space, it cant do anything
-	if r <= 0.0: #if there's no radius just use a normal raycast- the path is clear if the ray doesnt return any hits
-		_rquery.from = from
-		_rquery.to = to
-		return space.intersect_ray(_rquery).is_empty()
-	return _sweep(from, to, r) #runs the shape query
-
-##returns if a sphere of radius r can pass between 2 points without hitting anything
-func _sweep(from: Vector3, to: Vector3, r: float) -> bool:
-	#use the query with the radius and in a motion from the agent position to the target point 
-	#position- the path is clear if there were no overlaps, or the safe fraction (element 1 
-	#in the return list) is 1, meaning that the shape can travel the entire motion without hitting anything
-	_sphere.radius = r
-	_squery.transform = Transform3D(Basis(), from)
-	_squery.motion = to - from
-	var h: Array = space.cast_motion(_squery)
-	return h.is_empty() or h[0] >= 1.0
-
-##filters whether neighboors can be used or not, skipping paths between points too thim for the
+##filters whether neighboors can be used or not, skipping paths between points too thin for the
 ##current radius- if true a point wont be processed
 func _filter_neighbor(from_id: int, neighbor_id: int) -> bool:
 	if space == null: return false #if there's no space tracking, the point is always valid
@@ -72,7 +37,7 @@ func _filter_neighbor(from_id: int, neighbor_id: int) -> bool:
 	var r: Dictionary = _resolved[b]
 	#if the point pair already exists, return the cached clear value
 	if e.get(from_id, {}).has(neighbor_id): return !e[from_id][neighbor_id]
-	var c: bool = true #assume that the path is clear
+	var c: bool #if the path is clear or not
 	if b > 0.0: #if the radius is larger than 0, created the resolved positions
 		if !r.has(from_id):     r[from_id] = _resolve_pos(get_point_position(from_id), b)
 		if !r.has(neighbor_id): r[neighbor_id] = _resolve_pos(get_point_position(neighbor_id), b)
@@ -87,12 +52,23 @@ func _filter_neighbor(from_id: int, neighbor_id: int) -> bool:
 	e[neighbor_id][from_id] = c
 	return !c #return the oppisote of clear so if it wasnt clear, true would be returned and the point wont be processed
 
+##returns if a sphere of radius r can pass between 2 points without hitting anything
+func _sweep(from: Vector3, to: Vector3, r: float) -> bool:
+	#use the query with the radius and in a motion from the agent position to the target point 
+	#position- the path is clear if there were no overlaps, or the safe fraction (element 1 
+	#in the return list) is 1, meaning that the shape can travel the entire motion without hitting anything
+	_sphere.radius = r
+	_squery.transform = Transform3D(Basis(), from)
+	_squery.motion = to - from
+	var h: Array = space.cast_motion(_squery)
+	return h.is_empty() or h[0] >= 1.0
+
 ##pushes a sphere of radius r at position b out of anything it overlaps and returning that
 ##new position of the sphere
 func _resolve_pos(b: Vector3, r: float) -> Vector3:
 	var res: Vector3 = b #the new position to return
 	_sphere.radius = r
-	for i: int in PUSH_STEPS: #repeat a number of times to the sphere is guranteed to be free
+	for i: int in PUSH_STEPS: #repeat a number of times so the sphere is guranteed to be free
 		#update the position of the sphere to the current position to be checked then run the query
 		#which returns where the sphere hits other collision objects
 		_squery.transform = Transform3D(Basis(), res)
@@ -112,5 +88,31 @@ func _resolve_pos(b: Vector3, r: float) -> Vector3:
 			if d < r and d > 0.0001: 
 				p += to.normalized() * (r - d)
 				c += 1
+		if c == 0: break #prevents dividing by 0- also there's no points to even push by anyways
 		res += p / c #add the push to the result and normalize with count
 	return res #return the new pushed position
+
+##calls set_point_disabled, but updates the version too
+func set_disabled(id: int, disabled: bool = true) -> void:
+	if has_point(id) and is_point_disabled(id) != disabled:
+		set_point_disabled(id, disabled)
+		ver += 1
+
+##calls get_id_path, but updates the space and radius; space and radius are also updated for the
+##path resolving with filter neighboor
+func find_path(from: Vector3, to: Vector3, _radius: float, _space: PhysicsDirectSpaceState3D) -> PackedInt64Array:
+	space = _space
+	radius = _radius
+	var a: int = get_closest_point(from)
+	var b: int = get_closest_point(to)
+	return PackedInt64Array() if a == -1 or b == -1 else get_id_path(a, b) #prevent bad stuff from happening if there are no points
+
+##returns if a sphere of radius r can pass between 2 points without hitting anything
+##but also does a normal raycast if the radius is 0 or below
+func is_clear(from: Vector3, to: Vector3, r: float) -> bool:
+	if space == null: return false #if there's no space, it cant do anything
+	if r <= 0.0: #if there's no radius just use a normal raycast- the path is clear if the ray doesnt return any hits
+		_rquery.from = from
+		_rquery.to = to
+		return space.intersect_ray(_rquery).is_empty()
+	return _sweep(from, to, r) #runs the shape query
